@@ -1,0 +1,427 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1180</width>
+    <height>850</height>
+   </rect>
+  </property>
+  <property name="minimumSize">
+   <size>
+    <width>980</width>
+    <height>700</height>
+   </size>
+  </property>
+  <property name="windowTitle">
+   <string>LoD 2.2 CityJSON Generator</string>
+  </property>
+
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="mainLayout">
+    <property name="leftMargin"><number>16</number></property>
+    <property name="topMargin"><number>14</number></property>
+    <property name="rightMargin"><number>16</number></property>
+    <property name="bottomMargin"><number>12</number></property>
+    <property name="spacing"><number>12</number></property>
+
+    <item>
+     <widget class="QGroupBox" name="gb_input">
+      <property name="title">
+       <string>Input data</string>
+      </property>
+
+      <layout class="QGridLayout" name="gridInput">
+       <property name="horizontalSpacing"><number>10</number></property>
+       <property name="verticalSpacing"><number>10</number></property>
+
+       <item row="0" column="0">
+        <widget class="QLabel" name="labelConfig">
+         <property name="text">
+          <string>Configuration file:</string>
+         </property>
+        </widget>
+       </item>
+
+       <item row="0" column="1">
+        <widget class="QLineEdit" name="le_config">
+         <property name="placeholderText">
+          <string>Optional: select a MultiRoofs Roofer .toml configuration</string>
+         </property>
+        </widget>
+       </item>
+
+       <item row="0" column="2">
+        <widget class="QPushButton" name="pb_browse_config">
+         <property name="text">
+          <string>Browse</string>
+         </property>
+         <property name="minimumWidth">
+          <number>100</number>
+         </property>
+        </widget>
+       </item>
+
+       <item row="0" column="3">
+        <widget class="QPushButton" name="pb_clear_config">
+         <property name="text">
+          <string>Clear</string>
+         </property>
+         <property name="toolTip">
+          <string>Forget the configuration file and use the paths below directly</string>
+         </property>
+         <property name="minimumWidth">
+          <number>80</number>
+         </property>
+        </widget>
+       </item>
+
+       <item row="1" column="0">
+        <widget class="QLabel" name="labelCloud">
+         <property name="text">
+          <string>LiDAR point cloud(s):</string>
+         </property>
+        </widget>
+       </item>
+
+       <item row="1" column="1">
+        <widget class="QLineEdit" name="le_cloud">
+         <property name="placeholderText">
+          <string>Select a .las or .laz point cloud, or a folder with point clouds</string>
+         </property>
+        
+         <property name="readOnly"><bool>true</bool></property></widget>
+       </item>
+
+       <item row="1" column="2">
+        <widget class="QPushButton" name="pb_browse_cloud">
+         <property name="text">
+          <string>Browse</string>
+         </property>
+         <property name="minimumWidth">
+          <number>100</number>
+         </property>
+        </widget>
+       </item>
+
+       <item row="1" column="3">
+        <widget class="QPushButton" name="pb_browse_cloud_folder">
+         <property name="text">
+          <string>Folder</string>
+         </property>
+         <property name="toolTip">
+          <string>Select a folder that contains .las/.laz files</string>
+         </property>
+         <property name="minimumWidth">
+          <number>80</number>
+         </property>
+        </widget>
+       </item>
+
+       <item row="2" column="0">
+        <widget class="QLabel" name="labelFootprint">
+         <property name="text">
+          <string>Building footprints:</string>
+         </property>
+        </widget>
+       </item>
+
+       <item row="2" column="1">
+        <widget class="QLineEdit" name="le_footprint">
+         <property name="placeholderText">
+          <string>Select a .gpkg building footprint file</string>
+         </property>
+        </widget>
+       </item>
+
+       <item row="2" column="2">
+        <widget class="QPushButton" name="pb_browse_footprint">
+         <property name="text">
+          <string>Browse</string>
+         </property>
+         <property name="minimumWidth">
+          <number>100</number>
+         </property>
+        </widget>
+       </item>
+
+       <item row="3" column="0">
+        <widget class="QLabel" name="labelOutput">
+         <property name="text">
+          <string>Output folder:</string>
+         </property>
+        </widget>
+       </item>
+
+       <item row="3" column="1">
+        <widget class="QLineEdit" name="le_output">
+         <property name="placeholderText">
+          <string>Select the output folder</string>
+         </property>
+        </widget>
+       </item>
+
+       <item row="3" column="2">
+        <widget class="QPushButton" name="pb_browse_output">
+         <property name="text">
+          <string>Browse</string>
+         </property>
+         <property name="minimumWidth">
+          <number>100</number>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+     <layout class="QHBoxLayout" name="actionButtonsLayout">
+      <property name="spacing"><number>10</number></property>
+
+      <item>
+       <widget class="QPushButton" name="pb_generate">
+        <property name="text">
+         <string>Generate LoD 2.2 CityJSON</string>
+        </property>
+        <property name="minimumWidth">
+         <number>260</number>
+        </property>
+        <property name="minimumHeight">
+         <number>36</number>
+        </property>
+       </widget>
+      </item>
+
+      <item>
+       <widget class="QPushButton" name="pb_cancel">
+        <property name="text">
+         <string>Stop</string>
+        </property>
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="minimumWidth">
+         <number>110</number>
+        </property>
+        <property name="minimumHeight">
+         <number>36</number>
+        </property>
+       </widget>
+      </item>
+
+      <item>
+       <widget class="QPushButton" name="pb_view">
+        <property name="text">
+         <string>View with CityJSON Ninja</string>
+        </property>
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="minimumWidth">
+         <number>200</number>
+        </property>
+        <property name="minimumHeight">
+         <number>36</number>
+        </property>
+       </widget>
+      </item>
+
+      <item>
+       <widget class="QProgressBar" name="pbar_running">
+        <property name="minimum"><number>0</number></property>
+        <property name="maximum"><number>0</number></property>
+        <property name="textVisible"><bool>false</bool></property>
+        <property name="visible"><bool>false</bool></property>
+        <property name="maximumWidth"><number>220</number></property>
+       </widget>
+      </item>
+
+      <item>
+       <spacer name="actionButtonsSpacer">
+        <property name="orientation">
+         <enum>Qt::Orientation::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="gb_generated">
+      <property name="title">
+       <string>Generated files</string>
+      </property>
+
+      <layout class="QVBoxLayout" name="generatedGroupLayout">
+       <item>
+        <widget class="QLabel" name="lb_run_folder">
+         <property name="text">
+          <string>No model generated yet.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="textInteractionFlags">
+          <set>Qt::TextInteractionFlag::TextSelectableByMouse</set>
+         </property>
+        </widget>
+       </item>
+
+       <item>
+        <widget class="QScrollArea" name="sa_files">
+         <property name="widgetResizable">
+          <bool>true</bool>
+         </property>
+         <property name="minimumHeight">
+          <number>120</number>
+         </property>
+         <widget class="QWidget" name="files_widget">
+          <layout class="QVBoxLayout" name="files_layout">
+           <property name="leftMargin"><number>0</number></property>
+           <property name="topMargin"><number>0</number></property>
+           <property name="rightMargin"><number>0</number></property>
+           <property name="bottomMargin"><number>0</number></property>
+           <property name="spacing"><number>8</number></property>
+          </layout>
+         </widget>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="gb_log">
+      <property name="title">
+       <string>Processing messages</string>
+      </property>
+
+      <layout class="QVBoxLayout" name="logLayout">
+       <item>
+        <widget class="QPlainTextEdit" name="log_box">
+         <property name="readOnly">
+          <bool>true</bool>
+         </property>
+         <property name="minimumHeight">
+          <number>220</number>
+         </property>
+         <property name="maximumBlockCount">
+          <number>5000</number>
+         </property>
+        </widget>
+       </item>
+
+       <item>
+        <layout class="QHBoxLayout" name="logButtonsLayout">
+         <item>
+          <spacer name="logButtonsSpacer">
+           <property name="orientation">
+            <enum>Qt::Orientation::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+
+         <item>
+          <widget class="QPushButton" name="pb_copy_log">
+           <property name="text">
+            <string>Copy log</string>
+           </property>
+          </widget>
+         </item>
+
+         <item>
+          <widget class="QPushButton" name="pb_save_log">
+           <property name="text">
+            <string>Save log...</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </item>
+
+   </layout>
+  </widget>
+
+  <widget class="QMenuBar" name="menubar">
+   <property name="geometry">
+    <rect>
+     <x>0</x>
+     <y>0</y>
+     <width>1180</width>
+     <height>24</height>
+    </rect>
+   </property>
+
+   <widget class="QMenu" name="menuFile">
+    <property name="title">
+     <string>File</string>
+    </property>
+    <addaction name="actionSettings"/>
+    <addaction name="actionOpenRunFolder"/>
+    <addaction name="separator"/>
+    <addaction name="actionClose"/>
+   </widget>
+
+   <widget class="QMenu" name="menuHelp">
+    <property name="title">
+     <string>Help</string>
+    </property>
+    <addaction name="actionAbout"/>
+   </widget>
+
+   <addaction name="menuFile"/>
+   <addaction name="menuHelp"/>
+  </widget>
+
+  <widget class="QStatusBar" name="statusbar"/>
+
+  <action name="actionSettings">
+   <property name="text">
+    <string>Settings</string>
+   </property>
+  </action>
+
+  <action name="actionOpenRunFolder">
+   <property name="text">
+    <string>Open run folder</string>
+   </property>
+   <property name="enabled">
+    <bool>false</bool>
+   </property>
+  </action>
+
+  <action name="actionClose">
+   <property name="text">
+    <string>Close</string>
+   </property>
+  </action>
+
+  <action name="actionAbout">
+   <property name="text">
+    <string>About</string>
+   </property>
+  </action>
+ </widget>
+
+ <resources/>
+ <connections/>
+</ui>
