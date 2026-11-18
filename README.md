@@ -26,6 +26,7 @@ If you don't want to install this tool and you prefer running the source code, y
    python main.py
 ```
 
+Check out the [Documentation](https://multiroofs.github.io/MultiRoofs_docs/tools/CityJSON/tutorials/using-ui.html) to know how to use this tool.
 
 # Build the MultiRoofs executables
 
