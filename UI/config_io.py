@@ -10,6 +10,7 @@ that into a message box.
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -83,14 +84,23 @@ def write_document(
     temp_path = target_path.with_name(target_path.name + ".writing")
 
     try:
+        newline = "\n"
+        if target_path.is_file():
+            original_bytes = target_path.read_bytes()
+            if b"\r\n" in original_bytes:
+                newline = "\r\n"
+            elif b"\r" in original_bytes:
+                newline = "\r"
+
         if make_backup and target_path.is_file():
             backup_path = target_path.with_name(target_path.name + ".bak")
-            backup_path.write_text(
-                target_path.read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
+            if not backup_path.exists():
+                shutil.copy2(target_path, backup_path)
 
-        temp_path.write_text(text, encoding="utf-8")
+        normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
+        output_text = normalized_text.replace("\n", newline)
+        with temp_path.open("w", encoding="utf-8", newline="") as stream:
+            stream.write(output_text)
         os.replace(temp_path, target_path)
     except OSError as error:
         temp_path.unlink(missing_ok=True)

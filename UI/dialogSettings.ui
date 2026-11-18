@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>620</width>
-    <height>190</height>
+    <height>300</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -51,6 +51,32 @@
      <property name="wordWrap">
       <bool>true</bool>
      </property>
+    </widget>
+   </item>
+
+   <item>
+    <widget class="QLabel" name="label_cjseq">
+     <property name="text"><string>cjseq executable (optional):</string></property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="cjseqPathLayout">
+     <item>
+      <widget class="QLineEdit" name="le_cjseq">
+       <property name="placeholderText"><string>Auto-detected from CJSEQ_PATH, PATH, or Cargo</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pb_browse_cjseq">
+       <property name="text"><string>Browse</string></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QLabel" name="lb_cjseq_status">
+     <property name="text"><string/></property>
+     <property name="wordWrap"><bool>true</bool></property>
     </widget>
    </item>
 

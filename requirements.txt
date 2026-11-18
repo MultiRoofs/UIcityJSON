@@ -1,1 +1,3 @@
-tomlkit, PyQt6
+tomlkit
+PyQt6
+PyInstaller

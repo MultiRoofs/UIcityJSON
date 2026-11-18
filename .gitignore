@@ -1,2 +1,10 @@
 /.idea
 /UI/__pycache__
+/multiroofs-build/MultiRoofs_Windows/build
+/multiroofs-build/MultiRoofs_Windows/dist
+/multiroofs-build/MultiRoofs_Windows/installer_output
+/multiroofs-build/MultiRoofs_Linux/build
+/multiroofs-build/MultiRoofs_Linux/dist
+/multiroofs-build/MultiRoofs_Linux/MultiRoofs.AppDir
+/multiroofs-build/MultiRoofs_Linux/release
+venv

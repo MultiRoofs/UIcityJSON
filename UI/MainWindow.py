@@ -4,15 +4,11 @@ The window drives the Roofer CLI:
 
     roofer [options] <pointcloud> <polygon-source> <output-directory>
     roofer -c <config.toml> [<pointcloud> <polygon-source>] <output-directory>
-
-The output directory is always passed on the command line - also in
-configuration mode - because Roofer requires it as the last positional
-argument. Every run gets its own timestamped folder so previous results
-are never overwritten.
 """
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import subprocess
@@ -21,26 +17,43 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt6 import uic
-from PyQt6.QtCore import QFileInfo, QProcess, QSettings, QSize, Qt, QUrl
-from PyQt6.QtGui import QCloseEvent, QDesktopServices
+from PyQt6.QtCore import QProcess, QSettings, Qt, QTimer, QUrl
+from PyQt6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QTextBlockFormat,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
-    QFileIconProvider,
     QMainWindow,
-    QMenu,
     QMessageBox,
-    QPushButton,
 )
 
 from UI import config_io
+from UI.cjseq_worker import CjseqConversionWorker
 from UI.config_io import ConfigError
 from UI.DialogAbout import DialogAbout
-from UI.DialogSettings import DialogSettings, SETTINGS_ROOFER_PATH
+from UI.DialogSettings import (
+    DialogSettings,
+    SETTINGS_APP,
+    SETTINGS_CJSEQ_PATH,
+    SETTINGS_ORG,
+    SETTINGS_ROOFER_PATH,
+    executable_problem,
+    find_cjseq,
+    find_roofer_in_path,
+)
+from UI.resource_utils import resource_path
 
 
 CITYJSON_NINJA_URL = "https://ninja.cityjson.org/"
+SETTINGS_HIDE_NINJA_MESSAGE = "view_cityjson/hide_instruction_message"
 
 # Roofer writes CityJSONSequence files; the exact extension has changed
 # between releases, so several patterns are accepted. Order matters: the
@@ -50,9 +63,20 @@ OUTPUT_PATTERNS = ("*.city.jsonl", "*.jsonl", "*.city.json")
 # Only these file extensions are accepted as LiDAR point-cloud files.
 LIDAR_SUFFIXES = {".las", ".laz"}
 
+# Positions of the entries in the LiDAR mode combo box (cmb_cloud_mode).
+CLOUD_MODE_FILES = 0
+CLOUD_MODE_FOLDER = 1
+
+# How long a stopped Roofer may take to exit before it is killed.
+STOP_GRACE_MS = 3000
+
 # Temporary run configurations are written next to the original TOML so
 # that all other relative paths inside it keep their meaning.
 TEMP_CONFIG_PREFIX = ".multiroofs_run_"
+
+# A worker that outlives its window must retain a Python reference until its
+# underlying thread finishes. Otherwise PyQt may delete a running QThread.
+_orphaned_workers: set[CjseqConversionWorker] = set()
 
 
 class MainWindow(QMainWindow):
@@ -60,15 +84,19 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         # Load the interface designed in Qt Designer.
-        ui_file = Path(__file__).resolve().parent / "mainWindow.ui"
-        uic.loadUi(ui_file, self)
+        uic.loadUi(resource_path("mainWindow.ui"), self)
 
         # QSettings remembers application/session settings.
-        self.settings = QSettings()
+        # Use an explicit identity so source runs and packaged Windows builds
+        # always read and write the same settings store.
+        self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        # Prevent textChanged handlers from saving partially restored fields.
+        self._restoring_session = False
 
         # QProcess is the connection used by the GUI to start Roofer
+        # Create an object that can ask the operating system to start and control another program.
         # as an external operating-system process.
-        self.process = QProcess(self)
+        self.process = QProcess(self) #creates a QProcess object.
         self.process.setProcessChannelMode(
             QProcess.ProcessChannelMode.MergedChannels
         )
@@ -94,11 +122,23 @@ class MainWindow(QMainWindow):
         self.run_config: Path | None = None
         self.stop_requested = False
 
+        # Background CityJSONSeq -> CityJSON conversion, while one is running.
+        self.converter: CjseqConversionWorker | None = None
+
+        # Identifies the current Roofer run, so a delayed "kill" timer from
+        # an earlier run can never stop a later one.
+        self.run_serial = 0
+
+        # Roofer output arrives in chunks that may split a multi-byte
+        # character, so it is decoded incrementally.
+        self.output_decoder = codecs.getincrementaldecoder("utf-8")(
+            errors="replace"
+        )
+
         # --- signals ---------------------------------------------------
         self.pb_browse_config.clicked.connect(self.browse_config_file)
         self.pb_clear_config.clicked.connect(self.clear_config_file)
-        self.pb_browse_cloud.clicked.connect(self.browse_lidar_file)
-        self.pb_browse_cloud_folder.clicked.connect(self.browse_lidar_folder)
+        self.pb_browse_cloud.clicked.connect(self.browse_lidar)
         self.pb_browse_footprint.clicked.connect(self.browse_footprint_file)
         self.pb_browse_output.clicked.connect(self.browse_output_folder)
 
@@ -114,6 +154,12 @@ class MainWindow(QMainWindow):
         self.actionAbout.triggered.connect(self.show_about)
         self.actionClose.triggered.connect(self.close)
 
+        # Persist input paths as soon as they change, instead of waiting for
+        # a normal close or a conversion. This survives crashes and restarts.
+        self.le_config.textChanged.connect(self.store_session)
+        self.le_footprint.textChanged.connect(self.store_session)
+        self.le_output.textChanged.connect(self.store_session)
+
         # QProcess signals.
         self.process.readyReadStandardOutput.connect(self.read_process_output)
         self.process.finished.connect(self.process_finished)
@@ -125,9 +171,21 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Session persistence
     # ------------------------------------------------------------------
-
+# the setting that is saved in  the  settings goes to the → GUI
     def restore_session(self) -> None:
         """Restore the paths that were used the last time."""
+        self._restoring_session = True
+        try:
+            self._restore_session_values()
+        finally:
+            self._restoring_session = False
+        self.store_session()
+
+    def _restore_session_values(self) -> None:
+        """Restore fields without allowing intermediate signal saves."""
+        saved_footprint = self.settings.value("session/footprint", "", type=str)
+        saved_output = self.settings.value("session/output", "", type=str)
+
         mode = self.settings.value(
             "session/lidar_mode",
             "",
@@ -146,7 +204,8 @@ class MainWindow(QMainWindow):
                 values = json.loads(values_text)
             except (TypeError, json.JSONDecodeError):
                 values = []
-
+#Continue only if values is actually a Python list   For example: values = ["a.las", "b.las"]
+# This section address 3 cases of lidar (list, folder, path)
             if isinstance(values, list):
                 paths = [
                     Path(value)
@@ -175,19 +234,26 @@ class MainWindow(QMainWindow):
                 else:
                     self.set_lidar_files([legacy_path])
 
-        self.le_footprint.setText(
-            self.settings.value("session/footprint", "", type=str)
-        )
-        self.le_output.setText(
-            self.settings.value("session/output", "", type=str)
-        )
+        self.le_footprint.setText(saved_footprint)
+        self.le_output.setText(saved_output)
 
         config_text = self.settings.value("session/config", "", type=str)
 
+        # Keep showing the saved path even when the file was moved or deleted;
+        # validation will explain the problem when the user runs the job.
+        self.le_config.setText(config_text)
         if config_text and Path(config_text).is_file():
             self.load_config_file(Path(config_text), quiet=True)
+            # Loading TOML fills its own paths. Explicit session selections
+            # take precedence, including a previously chosen output folder.
+            if saved_footprint:
+                self.le_footprint.setText(saved_footprint)
+            if saved_output:
+                self.le_output.setText(saved_output)
 
     def store_session(self) -> None:
+        if self._restoring_session:
+            return
         self.settings.setValue(
             "session/config",
             self.le_config.text().strip(),
@@ -217,6 +283,7 @@ class MainWindow(QMainWindow):
             "session/output",
             self.le_output.text().strip(),
         )
+        self.settings.sync()
 
     def start_dir(self, key: str, fallback: str = "") -> str:
         """Remembered starting folder for a file dialog."""
@@ -239,7 +306,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def show_settings(self) -> None:
-        DialogSettings(self).exec()
+        self.run_settings_dialog()
+
+    def run_settings_dialog(self) -> bool:
+        """Show the settings dialog; True when the user saved the settings."""
+        dialog = DialogSettings(self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        return dialog.exec() == QDialog.DialogCode.Accepted
 
     def get_roofer_path(self) -> Path | None:
         """The configured Roofer executable, asking for it when needed."""
@@ -254,20 +327,25 @@ class MainWindow(QMainWindow):
             "Select the Roofer executable before generating a model.",
         )
 
-        if DialogSettings(self).exec() != QDialog.DialogCode.Accepted:
+        if not self.run_settings_dialog():
             return None
 
         return self.stored_roofer_path()
 
     def stored_roofer_path(self) -> Path | None:
         saved_path = self.settings.value(SETTINGS_ROOFER_PATH, "", type=str)
+        if saved_path:
+            try:
+                path = Path(saved_path).expanduser()
+                if executable_problem(path) is None:
+                    return path
+            except (OSError, TypeError, ValueError):
+                pass
 
-        if not saved_path:
+        try:
+            return find_roofer_in_path()
+        except (OSError, TypeError, ValueError):
             return None
-
-        roofer_path = Path(saved_path)
-
-        return roofer_path if roofer_path.is_file() else None
 
     # ------------------------------------------------------------------
     # Configuration file
@@ -282,7 +360,8 @@ class MainWindow(QMainWindow):
         )
 
         if filename:
-            self.load_config_file(Path(filename))
+            if self.load_config_file(Path(filename)):
+                self.store_session()
 
     def clear_config_file(self) -> None:
         """Forget the configuration and return to direct-input mode.
@@ -335,19 +414,27 @@ class MainWindow(QMainWindow):
             config_io.can_edit_pointcloud_sources(document)
         )
 
+# that sends the values from the config_mr to the GUI
         self.le_config.setText(str(config_path))
         self.remember_dir("config", config_path)
 
         # Missing config values intentionally clear the UI fields.
-        if lidar_sources:
+        if len(lidar_sources) == 1 and Path(lidar_sources[0]).is_dir():
+            # Roofer accepts a folder as a point-cloud source.
+            self.set_lidar_folder(Path(lidar_sources[0]))
+        elif lidar_sources:
             self.set_lidar_files(
                 [Path(path) for path in lidar_sources]
             )
         else:
             self.clear_lidar_selection()
 
-        self.le_footprint.setText(paths["footprint"])
-        self.le_output.setText(paths["output"])
+        # A TOML file may omit these optional values. Do not replace a path
+        # already selected by the user with an empty string.
+        if paths["footprint"]:
+            self.le_footprint.setText(paths["footprint"])
+        if paths["output"]:
+            self.le_output.setText(paths["output"])
 
         self.update_lidar_controls()
 
@@ -436,12 +523,20 @@ class MainWindow(QMainWindow):
     def config_paths_changed(self) -> bool:
         current = self.current_ui_paths()
 
+        # The output folder is mandatory in the interface, but the TOML only
+        # has a value to compare against when it sets ``output-directory``.
+        # Comparing it otherwise would report a change on every single run.
+        keys = ["footprint"]
+
+        if config_io.has_output_directory(self.config_document):
+            keys.append("output")
+
         if any(
             current[key]
             != self.normalized_path_text(
                 self.config_snapshot.get(key, "")
             )
-            for key in ("footprint", "output")
+            for key in keys
         ):
             return True
 
@@ -466,6 +561,18 @@ class MainWindow(QMainWindow):
         None means the user cancelled or an error was already reported.
         """
         if self.config_path is None or self.config_document is None:
+            return None
+
+        # Re-read the file: it may have been edited outside the GUI since it
+        # was loaded, e.g. an ``output-directory`` added by hand.
+        try:
+            self.config_document = config_io.load_document(self.config_path)
+        except ConfigError as error:
+            QMessageBox.critical(
+                self,
+                "Invalid configuration file",
+                str(error),
+            )
             return None
 
         current = self.current_ui_paths()
@@ -651,18 +758,27 @@ class MainWindow(QMainWindow):
             path.expanduser()
             for path in paths
         ]
+
+        # Keep the GUI mode synchronized with the actual LiDAR input.
+        self.cmb_cloud_mode.setCurrentIndex(CLOUD_MODE_FILES)
+
         self.update_lidar_display()
 
     def set_lidar_folder(self, path: Path) -> None:
         """Use a folder containing LAS/LAZ files as the LiDAR input."""
         self.lidar_files = []
         self.lidar_folder = path.expanduser()
+
+        # Keep the GUI mode synchronized with the actual LiDAR input.
+        self.cmb_cloud_mode.setCurrentIndex(CLOUD_MODE_FOLDER)
+
         self.update_lidar_display()
 
     def clear_lidar_selection(self) -> None:
         self.lidar_files = []
         self.lidar_folder = None
         self.update_lidar_display()
+        self.store_session()
 
     def update_lidar_display(self) -> None:
         if self.lidar_folder is not None:
@@ -698,14 +814,11 @@ class MainWindow(QMainWindow):
     def update_lidar_controls(self, processing: bool | None = None) -> None:
         """Enable LiDAR selection unless the config locks it or a run is busy.
 
-        This is the single place that decides the state of the two LiDAR
-        buttons; ``set_processing_state`` delegates to it.
+        This is the single place that controls the LiDAR mode combo box
+        and Browse button; ``set_processing_state`` delegates to it.
         """
         if processing is None:
-            processing = (
-                self.process.state()
-                != QProcess.ProcessState.NotRunning
-            )
+            processing = self.is_busy()
 
         editable = (
             self.config_path is None
@@ -714,7 +827,18 @@ class MainWindow(QMainWindow):
         enabled = editable and not processing
 
         self.pb_browse_cloud.setEnabled(enabled)
-        self.pb_browse_cloud_folder.setEnabled(enabled)
+        self.cmb_cloud_mode.setEnabled(enabled)
+
+    def browse_lidar(self) -> None:
+        """Open the LiDAR browser selected in ``cmb_cloud_mode``.
+
+        Index 0 selects one or more LAS/LAZ files.
+        Index 1 selects a folder containing LAS/LAZ files.
+        """
+        if self.cmb_cloud_mode.currentIndex() == CLOUD_MODE_FOLDER:
+            self.browse_lidar_folder()
+        else:
+            self.browse_lidar_file()
 
     def browse_lidar_file(self) -> None:
         filenames, _ = QFileDialog.getOpenFileNames(
@@ -735,6 +859,7 @@ class MainWindow(QMainWindow):
                 for filename in filenames
             ]
             self.set_lidar_files(paths)
+            self.store_session()
             self.remember_dir(
                 "lidar",
                 paths[0],
@@ -753,16 +878,31 @@ class MainWindow(QMainWindow):
             return
 
         path = Path(folder)
+        problem = self.lidar_folder_problem(path)
 
+        if problem is not None:
+            self.show_warning(*problem)
+            return
+
+        # Every file passed validation, so accept the folder.
+        self.set_lidar_folder(path)
+        self.store_session()
+        self.remember_dir(
+            "lidar",
+            path,
+        )
+
+    @staticmethod
+    def lidar_folder_problem(path: Path) -> tuple[str, str] | None:
+        """Return ``(title, message)`` when ``path`` is not a usable folder.
+
+        Only regular files directly inside the folder are checked, and the
+        folder must contain nothing but .las / .laz files.
+        """
         try:
-            # Only regular files directly inside the selected folder are checked.
-            files = [
-                child
-                for child in path.iterdir()
-                if child.is_file()
-            ]
+            files = [child for child in path.iterdir() if child.is_file()]
         except OSError as error:
-            self.show_warning(
+            return (
                 "Point-cloud folder unreadable",
                 (
                     "The selected folder could not be read:"
@@ -770,49 +910,34 @@ class MainWindow(QMainWindow):
                     f"\n\n{error}"
                 ),
             )
-            return
 
-        # The selected directory must contain at least one file.
         if not files:
-            self.show_warning(
+            return (
                 "Empty point-cloud folder",
                 (
                     "The selected folder is empty.\n\n"
                     "Select a folder containing only .las or .laz files."
                 ),
             )
-            return
 
-        # Reject the complete folder if any file is not LAS/LAZ.
-        invalid_files = [
-            child
+        invalid_names = [
+            child.name
             for child in files
             if child.suffix.lower() not in LIDAR_SUFFIXES
         ]
 
-        if invalid_files:
-            invalid_names = "\n".join(
-                child.name
-                for child in invalid_files
-            )
-
-            self.show_warning(
+        if invalid_names:
+            return (
                 "Invalid point-cloud folder",
                 (
                     "The selected folder must contain only "
                     ".las or .laz files.\n\n"
                     "Unsupported file(s) found:\n\n"
-                    f"{invalid_names}"
+                    + "\n".join(invalid_names)
                 ),
             )
-            return
 
-        # Every file passed validation, so accept the folder.
-        self.set_lidar_folder(path)
-        self.remember_dir(
-            "lidar",
-            path,
-        )
+        return None
 
     def browse_footprint_file(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -828,6 +953,7 @@ class MainWindow(QMainWindow):
                 "footprint",
                 Path(filename),
             )
+            self.store_session()
 
     def browse_output_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -842,6 +968,7 @@ class MainWindow(QMainWindow):
                 "output",
                 Path(folder),
             )
+            self.store_session()
 
     # ------------------------------------------------------------------
     # Input validation
@@ -919,57 +1046,12 @@ class MainWindow(QMainWindow):
                 )
                 return None
 
-            try:
-                # Validate again immediately before Roofer starts.
-                # This protects against files being added after selection.
-                files = [
-                    child
-                    for child in lidar_input.iterdir()
-                    if child.is_file()
-                ]
-            except OSError as error:
-                self.show_warning(
-                    "Point-cloud folder unreadable",
-                    (
-                        "The selected folder could not be read:"
-                        f"\n\n{lidar_input}"
-                        f"\n\n{error}"
-                    ),
-                )
-                return None
+            # Validate again immediately before Roofer starts. This protects
+            # against files being added after the folder was selected.
+            problem = self.lidar_folder_problem(lidar_input)
 
-            if not files:
-                self.show_warning(
-                    "Empty point-cloud folder",
-                    (
-                        "The selected folder is empty.\n\n"
-                        "Select a folder containing only .las or .laz files."
-                    ),
-                )
-                return None
-
-            # The folder must consist only of LAS/LAZ files.
-            invalid_files = [
-                child
-                for child in files
-                if child.suffix.lower() not in LIDAR_SUFFIXES
-            ]
-
-            if invalid_files:
-                invalid_names = "\n".join(
-                    child.name
-                    for child in invalid_files
-                )
-
-                self.show_warning(
-                    "Invalid point-cloud folder",
-                    (
-                        "The selected folder must contain only "
-                        ".las or .laz files.\n\n"
-                        "Unsupported file(s) found:\n\n"
-                        f"{invalid_names}"
-                    ),
-                )
+            if problem is not None:
+                self.show_warning(*problem)
                 return None
 
         else:
@@ -1035,7 +1117,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def generate_cityjson(self) -> None:
-        if self.process.state() != QProcess.ProcessState.NotRunning:
+        if self.is_busy():
             QMessageBox.information(
                 self,
                 "Roofer is running",
@@ -1050,16 +1132,17 @@ class MainWindow(QMainWindow):
 
         if validated is None:
             return
-
+#reading from  a TOML configuration
         roofer_path, lidar_input, footprint_path, output_path = validated
 
         self.generated_files = []
-        self.clear_generated_file_buttons()
         self.log_box.clear()
         self.pb_view.setEnabled(False)
         self.actionOpenRunFolder.setEnabled(False)
         self.cleanup_run_config()
         self.stop_requested = False
+        self.run_serial += 1
+        self.output_decoder.reset()
 
         run_folder = self.create_run_folder(
             output_path,
@@ -1115,7 +1198,6 @@ class MainWindow(QMainWindow):
             # libraries next to the executable are found on Windows.
             working_directory = roofer_path.parent
 
-        self.lb_run_folder.setText(f"Current run folder: {run_folder}")
         self.store_session()
 
         self.append_log(f"Roofer executable : {roofer_path}")
@@ -1231,17 +1313,42 @@ class MainWindow(QMainWindow):
         return run_folder
 
     def discard_run_folder(self) -> None:
-        """Remove the run folder again when nothing was written to it."""
-        if self.output_folder is not None:
-            try:
-                self.output_folder.rmdir()
-            except OSError:
-                pass
+        """Remove the run folder again when nothing was written to it.
+
+        A folder that already contains output is left alone (and stays
+        remembered, so the log and run-folder actions still point to it).
+        """
+        if self.output_folder is None:
+            return
+
+        try:
+            self.output_folder.rmdir()
+        except OSError:
+            return
 
         self.output_folder = None
-        self.lb_run_folder.setText("No model generated yet.")
 
     def stop_roofer(self) -> None:
+        if self.converter is not None:
+            answer = QMessageBox.question(
+                self,
+                "Stop conversion",
+                (
+                    "Stop the CityJSON conversion?\n\n"
+                    "The CityJSONSeq files written by Roofer are kept."
+                ),
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+
+            if answer == QMessageBox.StandardButton.Yes:
+                self.append_log("")
+                self.append_log("Stopping conversion...")
+                self.converter.requestInterruption()
+
+            return
+
         if self.process.state() == QProcess.ProcessState.NotRunning:
             return
 
@@ -1262,16 +1369,30 @@ class MainWindow(QMainWindow):
 
         self.process.terminate()
 
-        if not self.process.waitForFinished(3000):
+        # Do not block the interface while waiting: on Windows terminate()
+        # is ignored by console programs, so Roofer is killed after a short
+        # grace period from a timer instead of from a blocking wait.
+        serial = self.run_serial
+        QTimer.singleShot(
+            STOP_GRACE_MS,
+            lambda: self.kill_if_running(serial),
+        )
+
+    def kill_if_running(self, serial: int) -> None:
+        """Kill Roofer if the run identified by ``serial`` is still alive."""
+        if (
+            serial == self.run_serial
+            and self.process.state() != QProcess.ProcessState.NotRunning
+        ):
             self.process.kill()
 
     # ------------------------------------------------------------------
     # Roofer output
     # ------------------------------------------------------------------
 
-    def read_process_output(self) -> None:
-        raw_data = self.process.readAllStandardOutput()
-        text = bytes(raw_data).decode("utf-8", errors="replace")
+    def read_process_output(self, final: bool = False) -> None:
+        raw_data = bytes(self.process.readAllStandardOutput())
+        text = self.output_decoder.decode(raw_data, final=final)
 
         if text.strip():
             self.append_log(text.rstrip())
@@ -1281,11 +1402,12 @@ class MainWindow(QMainWindow):
         exit_code: int,
         exit_status: QProcess.ExitStatus,
     ) -> None:
-        self.read_process_output()
-        self.set_processing_state(False)
+        self.read_process_output(final=True)
         self.cleanup_run_config()
 
         if self.stop_requested:
+            self.set_processing_state(False)
+            self.discard_run_folder()
             self.statusbar.showMessage("Roofer stopped by the user")
             self.append_log("")
             self.append_log("Roofer was stopped before it finished.")
@@ -1296,6 +1418,8 @@ class MainWindow(QMainWindow):
             exit_status != QProcess.ExitStatus.NormalExit
             or exit_code != 0
         ):
+            self.set_processing_state(False)
+            self.discard_run_folder()
             self.statusbar.showMessage("Roofer failed")
             self.append_log("")
             self.append_log(f"Roofer stopped with exit code {exit_code}.")
@@ -1309,6 +1433,90 @@ class MainWindow(QMainWindow):
                 ),
             )
             return
+
+        if self.output_folder is None:
+            self.set_processing_state(False)
+            self.statusbar.showMessage("No output folder")
+            return
+
+        # Roofer is done. The interface stays locked while its CityJSONSeq
+        # files are converted to CityJSON in the background.
+        self.start_conversion(self.output_folder)
+
+    # ------------------------------------------------------------------
+    # CityJSONSeq -> CityJSON conversion (background thread)
+    # ------------------------------------------------------------------
+
+    def resolve_cjseq(self) -> Path | None:
+        """The cjseq executable from the settings, PATH or Cargo's bin."""
+        saved = self.settings.value(SETTINGS_CJSEQ_PATH, "", type=str).strip()
+
+        if saved and Path(saved).is_file():
+            return Path(saved)
+
+        return find_cjseq()
+
+    def start_conversion(self, folder: Path) -> None:
+        """Convert Roofer's CityJSONSeq files; the originals are preserved."""
+        sources = sorted(folder.rglob("*.jsonl"))
+
+        if not sources:
+            self.finish_run([])
+            return
+
+        cjseq = self.resolve_cjseq()
+
+        if cjseq is None:
+            # cjseq is an external executable, not a Python dependency.
+            # The user may install it, expose it on PATH, or choose it in Settings.
+            message = (
+                "cjseq was not found. Install cjseq if it is not installed, "
+                "add its executable directory to the PATH environment "
+                "variable, or select the cjseq executable in Settings."
+            )
+            self.append_log(f"ERROR: {message}", color="#c62828")
+            self.finish_run([message], cjseq_missing=True)
+            return
+
+        self.append_log("")
+        self.statusbar.showMessage("Converting CityJSONSeq to CityJSON...")
+
+        worker = CjseqConversionWorker(str(cjseq), sources, self)
+        worker.log.connect(self.on_conversion_log)
+        worker.done.connect(self.on_conversion_done)
+        worker.finished.connect(worker.deleteLater)
+
+        self.converter = worker
+        worker.start()
+
+    def on_conversion_log(self, text: str, color: str) -> None:
+        self.append_log(text, color or None)
+
+    def on_conversion_done(self, errors: list, cancelled: bool) -> None:
+        self.converter = None
+
+        if not cancelled:
+            self.finish_run([str(error) for error in errors])
+            return
+
+        self.set_processing_state(False)
+
+        if self.output_folder is not None:
+            self.generated_files = self.collect_output_files(
+                self.output_folder
+            )
+            self.actionOpenRunFolder.setEnabled(True)
+
+        self.pb_view.setEnabled(bool(self.cityjson_files()))
+        self.statusbar.showMessage("CityJSON conversion stopped by the user")
+        self.append_log("")
+        self.append_log("Conversion was stopped before it finished.")
+
+    def finish_run(
+        self, conversion_errors: list[str], cjseq_missing: bool = False
+    ) -> None:
+        """Report the result of a finished run (Roofer + conversion)."""
+        self.set_processing_state(False)
 
         if self.output_folder is None:
             self.statusbar.showMessage("No output folder")
@@ -1335,14 +1543,49 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.clear_generated_file_buttons()
-
         for file_path in self.generated_files:
-            self.add_generated_file_button(file_path)
             self.append_log(f"Created: {file_path}")
 
-        self.files_layout.addStretch(1)
-        self.pb_view.setEnabled(True)
+        # Only converted CityJSON files count as results: the CityJSONSeq
+        # files are kept next to them as intermediate output.
+        cityjson_files = self.cityjson_files()
+        self.pb_view.setEnabled(bool(cityjson_files))
+
+        if conversion_errors:
+            self.statusbar.showMessage(
+                "Roofer finished, some CityJSON conversions failed"
+                if cityjson_files
+                else "Roofer finished, CityJSON conversion failed"
+            )
+
+            QMessageBox.warning(
+                self,
+                "CityJSON conversion warning",
+                "Roofer finished, but some CityJSON conversions failed:\n\n"
+                + "\n".join(conversion_errors)
+                + (
+                    "" if cjseq_missing else "\n\nCheck the conversion errors above."
+                )
+                + "\n\nThe original CityJSONSeq files are still available.",
+            )
+            return
+
+        if not cityjson_files:
+            self.statusbar.showMessage("No converted CityJSON files found")
+            self.append_log(
+                "ERROR: Roofer finished, but no converted CityJSON "
+                "(.city.json) files were created.",
+                color="#c62828",
+            )
+            QMessageBox.warning(
+                self,
+                "No converted CityJSON files",
+                "Roofer finished, but no converted CityJSON (.city.json) "
+                "files were created. The original CityJSONSeq files "
+                "remain available in the run folder.",
+            )
+            return
+
         self.statusbar.showMessage(
             "LoD 2.2 CityJSON model created successfully"
         )
@@ -1352,9 +1595,17 @@ class MainWindow(QMainWindow):
             "Finished",
             (
                 "LoD 2.2 reconstruction completed successfully.\n\n"
-                f"{len(self.generated_files)} CityJSON file(s) created."
+                f"{len(cityjson_files)} CityJSON file(s) created with its corresponding CityJSONL file."
             ),
         )
+
+    def cityjson_files(self) -> list[Path]:
+        """The converted ``*.city.json`` files among the generated files."""
+        return [
+            path
+            for path in self.generated_files
+            if path.name.endswith(".city.json")
+        ]
 
     @staticmethod
     def collect_output_files(folder: Path) -> list[Path]:
@@ -1384,6 +1635,7 @@ class MainWindow(QMainWindow):
         self.set_processing_state(False)
         self.cleanup_run_config()
 
+        self.discard_run_folder()
         self.statusbar.showMessage("Could not start Roofer")
         self.append_log("")
         self.append_log(f"Process error: {message}")
@@ -1393,82 +1645,6 @@ class MainWindow(QMainWindow):
             "Could not run Roofer",
             f"Roofer could not be started:\n\n{message}",
         )
-
-    # ------------------------------------------------------------------
-    # Generated file buttons
-    # ------------------------------------------------------------------
-
-    def clear_generated_file_buttons(self) -> None:
-        while self.files_layout.count():
-            item = self.files_layout.takeAt(0)
-            widget = item.widget()
-
-            if widget is not None:
-                widget.deleteLater()
-
-    def add_generated_file_button(self, file_path: Path) -> None:
-        button = QPushButton(file_path.name)
-
-        icon = QFileIconProvider().icon(QFileInfo(str(file_path)))
-        button.setIcon(icon)
-        button.setIconSize(QSize(24, 24))
-        button.setMinimumHeight(44)
-        button.setToolTip(
-            f"{file_path}\n\nClick: show in file manager\n"
-            "Right-click: more actions"
-        )
-
-        button.clicked.connect(
-            lambda _checked=False, path=file_path: self.show_file_in_explorer(
-                path
-            )
-        )
-
-        button.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
-        button.customContextMenuRequested.connect(
-            lambda point, path=file_path, source=button: self.file_menu(
-                source,
-                point,
-                path,
-            )
-        )
-
-        self.files_layout.addWidget(button)
-
-    def file_menu(
-        self,
-        source: QPushButton,
-        point,
-        file_path: Path,
-    ) -> None:
-        menu = QMenu(self)
-
-        show_action = menu.addAction("Show in file manager")
-        open_action = menu.addAction("Open with default application")
-        copy_action = menu.addAction("Copy full path")
-        ninja_action = menu.addAction("Open CityJSON Ninja")
-
-        chosen = menu.exec(source.mapToGlobal(point))
-
-        if chosen is None:
-            return
-
-        if chosen == show_action:
-            self.show_file_in_explorer(file_path)
-        elif chosen == open_action:
-            QDesktopServices.openUrl(
-                QUrl.fromLocalFile(str(file_path))
-            )
-        elif chosen == copy_action:
-            QApplication.clipboard().setText(str(file_path))
-            self.statusbar.showMessage(
-                "Path copied to the clipboard",
-                4000,
-            )
-        elif chosen == ninja_action:
-            QDesktopServices.openUrl(QUrl(CITYJSON_NINJA_URL))
 
     # ------------------------------------------------------------------
     # View CityJSON
@@ -1481,14 +1657,20 @@ class MainWindow(QMainWindow):
         itself still has to be dragged into the page. The window therefore
         only prepares both sides of that drag.
         """
-        if not self.generated_files:
+        cityjson_files = self.cityjson_files()
+
+        if not cityjson_files:
             self.show_warning(
                 "No CityJSON file",
-                "Generate a CityJSON model first.",
+                (
+                    "No converted CityJSON (.city.json) file is available."
+                    "\n\nGenerate a model first. If the conversion failed, "
+                    "check that cjseq is installed."
+                ),
             )
             return
 
-        first_file = self.generated_files[0]
+        first_file = cityjson_files[0]
 
         if not first_file.is_file():
             QMessageBox.critical(
@@ -1501,15 +1683,35 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl(CITYJSON_NINJA_URL))
         self.show_file_in_explorer(first_file)
 
-        QMessageBox.information(
-            self,
-            "View CityJSON",
-            (
+        # The browser and file manager should always open. Only the
+        # explanatory message can be permanently hidden by the user.
+        hide_message = self.settings.value(
+            SETTINGS_HIDE_NINJA_MESSAGE,
+            False,
+            type=bool,
+        )
+
+        if not hide_message:
+            message_box = QMessageBox(self)
+            message_box.setIcon(QMessageBox.Icon.Information)
+            message_box.setWindowTitle("View CityJSON")
+            message_box.setText(
                 "CityJSON Ninja has been opened in your browser and the "
                 "file manager shows the generated file.\n\n"
                 f"Drag {first_file.name} into the Ninja page to view it."
-            ),
-        )
+            )
+            message_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+
+            dont_show_again = QCheckBox("Don't show this message again")
+            message_box.setCheckBox(dont_show_again)
+
+            message_box.exec()
+
+            if dont_show_again.isChecked():
+                self.settings.setValue(
+                    SETTINGS_HIDE_NINJA_MESSAGE,
+                    True,
+                )
 
     def open_run_folder(self) -> None:
         if self.output_folder is None or not self.output_folder.is_dir():
@@ -1564,11 +1766,28 @@ class MainWindow(QMainWindow):
     # Log helpers
     # ------------------------------------------------------------------
 
-    def append_log(self, text: str) -> None:
-        self.log_box.appendPlainText(text)
-
+    def append_log(self, text: str, color: str | None = None) -> None:
         scrollbar = self.log_box.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 2
+
+        # Use a document cursor so appending does not move the user's cursor,
+        # clear their selection, or force the viewport to the bottom.
+        cursor = QTextCursor(self.log_box.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        if not self.log_box.document().isEmpty():
+            # Start the new line with default formats, otherwise it would
+            # inherit the colour of the previous (coloured) line.
+            cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
+
+        text_format = QTextCharFormat()
+
+        if color is not None:
+            text_format.setForeground(QColor(color))
+
+        cursor.insertText(text, text_format)
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
 
     def copy_log(self) -> None:
         QApplication.clipboard().setText(
@@ -1619,6 +1838,13 @@ class MainWindow(QMainWindow):
     # State / cleanup
     # ------------------------------------------------------------------
 
+    def is_busy(self) -> bool:
+        """True while Roofer or the CityJSON conversion is running."""
+        return (
+            self.converter is not None
+            or self.process.state() != QProcess.ProcessState.NotRunning
+        )
+
     def set_processing_state(self, processing: bool) -> None:
         enabled = not processing
 
@@ -1659,13 +1885,19 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.process.state() != QProcess.ProcessState.NotRunning:
+        if self.is_busy():
+            what = (
+                "The CityJSON conversion"
+                if self.converter is not None
+                else "Roofer"
+            )
+
             answer = QMessageBox.question(
                 self,
-                "Roofer is still running",
+                "Still running",
                 (
-                    "Roofer is still running.\n\n"
-                    "Close the application and stop Roofer?"
+                    f"{what} is still running.\n\n"
+                    "Close the application and stop it?"
                 ),
                 QMessageBox.StandardButton.Yes
                 | QMessageBox.StandardButton.No,
@@ -1677,8 +1909,31 @@ class MainWindow(QMainWindow):
                 return
 
             self.stop_requested = True
-            self.process.kill()
-            self.process.waitForFinished(3000)
+
+            if self.converter is not None:
+                worker = self.converter
+                self.converter = None
+
+                # The window is closing: the worker must not call back into it.
+                for signal in (worker.log, worker.done):
+                    try:
+                        signal.disconnect()
+                    except TypeError:
+                        pass
+
+                worker.requestInterruption()
+                if not worker.wait(5000):
+                    # Keep the thread alive until it finishes; destroying a
+                    # running QThread can crash the application.
+                    _orphaned_workers.add(worker)
+                    worker.setParent(None)
+                    worker.finished.connect(
+                        lambda w=worker: _orphaned_workers.discard(w)
+                    )
+
+            if self.process.state() != QProcess.ProcessState.NotRunning:
+                self.process.kill()
+                self.process.waitForFinished(3000)
 
         self.cleanup_run_config()
         self.remove_stale_run_configs()

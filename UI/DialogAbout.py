@@ -20,11 +20,13 @@ from PyQt6.QtWidgets import QDialog, QLabel
 # ----------------------------------------------------------------------
 
 DEVELOPERS = (
-    "Alejandro Morales Hernandez",          # <-
+    "Alejandro Morales Hernandez",          # <- 
     "Razan Saadaldeen",            # <- 
 )
 
 YEAR = "2026"
+
+VERSION = "1.0.0" # UPDATE THIS WHEN THERE IS A NEW VERSION
 
 MULTIROOFS_URL = "https://multiroofs.nweurope.eu/"
 
@@ -80,7 +82,7 @@ class DialogAbout(QDialog):
             "<b>MultiRoofs</b> project:<br>"
             f"<a href='{MULTIROOFS_URL}'>{MULTIROOFS_URL}</a></p>"
             f"<p><b>Development team</b><br>{developers}</p>"
-            f"<p>{YEAR}</p>"
+            f"<p>v{VERSION} - {YEAR}</p>"
         )
 
     # ------------------------------------------------------------------
@@ -101,7 +103,7 @@ class DialogAbout(QDialog):
 
             if not logo_path.is_file():
                 continue
-
+#set the three images photos 
             pixmap = QPixmap(str(logo_path))
 
             # QPixmap returns a null pixmap for an unsupported or corrupt

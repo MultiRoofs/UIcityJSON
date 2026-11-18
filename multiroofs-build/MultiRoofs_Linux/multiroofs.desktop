@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MultiRoofs CityJSON Generator
+Comment=Generate LoD 2.2 CityJSON building models with Roofer
+Exec=MultiRoofs
+Icon=multiroofs
+Terminal=false
+Categories=Science;Utility;
